@@ -1,0 +1,10 @@
+# Install torch separately first, with the right CUDA wheel for Blackwell:
+#   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128
+# (fall back to cu124 if cu128 wheels unavailable)
+
+faster-whisper>=1.1.0
+sounddevice>=0.4.6
+numpy>=1.24
+pynput>=1.7.6
+Pillow>=10.0
+pystray>=0.19
