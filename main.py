@@ -105,7 +105,7 @@ class Dictation:
 
     def shutdown(self) -> None:
         try:
-            self.mic.stop()
+            self.mic.close()
         except Exception:
             pass
 
