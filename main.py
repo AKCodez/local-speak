@@ -23,6 +23,7 @@ from pynput import keyboard
 import logutil
 from asr import ASR
 from audio import MicStream
+from hotkey import HotkeyManager
 from inject import Typist
 from overlay import Overlay
 from tray import Tray
@@ -127,13 +128,12 @@ def main() -> None:
     )
     tray.start()
 
-    quit_hotkey = keyboard.GlobalHotKeys({
-        QUIT_COMBO: lambda: d.request_exit("Ctrl+Alt+Q"),
-    })
-    quit_hotkey.start()
-
-    dictate_listener = keyboard.Listener(on_press=d.on_press, on_release=d.on_release)
-    dictate_listener.start()
+    hotkeys = HotkeyManager(
+        on_press=d.on_press,
+        on_release=d.on_release,
+        global_hotkeys={QUIT_COMBO: lambda: d.request_exit("Ctrl+Alt+Q")},
+    )
+    hotkeys.start()
 
     signal.signal(signal.SIGINT, lambda *_: d.request_exit("SIGINT"))
     if hasattr(signal, "SIGBREAK"):
@@ -144,8 +144,7 @@ def main() -> None:
     except KeyboardInterrupt:
         d.request_exit("KeyboardInterrupt")
     finally:
-        dictate_listener.stop()
-        quit_hotkey.stop()
+        hotkeys.stop()
         tray.stop()
         d.shutdown()
     log.info("==== STT exit ====")
