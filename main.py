@@ -60,7 +60,6 @@ class Dictation:
             self.mic.start()
         self.overlay.call_on_ui(self.overlay.set_status, "Listening", True)
         self.overlay.call_on_ui(self.overlay.show)
-        log.info("listening")
 
     def on_release(self, key) -> None:
         if key != HOTKEY:
@@ -78,14 +77,11 @@ class Dictation:
     def _finalize(self, audio: np.ndarray) -> None:
         try:
             if audio.size < MIN_AUDIO_SAMPLES:
-                log.info("skipped (%.2fs < 0.25s)", audio.size / SAMPLE_RATE)
                 return
             transcript = self.asr.transcribe(audio).strip()
             if not transcript:
-                log.info("empty transcript")
                 return
             self.typist.type(transcript + " ")
-            log.info("typed: %r", transcript)
         except Exception:
             log.exception("transcribe error")
         finally:

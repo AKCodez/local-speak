@@ -36,6 +36,11 @@ def configure(level: int = logging.INFO) -> None:
     fh.setFormatter(fmt)
     root.addHandler(fh)
 
+    # Quiet third-party loggers that would otherwise leak per-clip metadata
+    # (audio duration, model download URLs) into the log file.
+    for name in ("faster_whisper", "httpx", "httpcore", "urllib3"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
     # Mirror to stdout only if a console is attached (i.e. run via run.bat,
     # not pythonw.exe which has no stdout).
     try:

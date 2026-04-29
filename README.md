@@ -22,7 +22,11 @@ End-to-end latency on an RTX 5090 for a 10 s clip: ~500 ms.
 
 - **100% local.** Your audio never leaves your machine. No account, no internet after setup.
 - **Hold-to-talk**, not always-listening. Zero privacy exposure outside your conscious use.
+- **No transcript logging.** The log file records lifecycle events only — never the audio you spoke or the text that was typed.
 - **Real-time waveform overlay** — a 340×68 px translucent bubble pinned bottom-centre, driven by the last 0.5 s of live mic audio (32 mirrored bars, log-scaled RMS, pulsing record dot with Gaussian-blurred halo).
+- **Clipboard-paste injection** — transcripts go via the clipboard and a single Ctrl+V, not per-keystroke typing. Avoids the "first character eaten by Ctrl+T / Ctrl+H" race that plagues hold-to-talk dictation. Your previous clipboard contents are saved and restored.
+- **250 ms pre-roll** — a rolling mic ring buffer means audio you spoke a beat before the hotkey still gets captured.
+- **Sleep-resilient hotkey** — a watchdog rebuilds the keyboard hooks after Windows sleep / hibernate, so Right Ctrl keeps working overnight without restarts.
 - **System-tray admin panel**: Pause, Start-with-Windows, Open log folder, Quit.
 - **Silent autostart** — optional. Toggled from the tray. Writes a single HKCU registry Run value (no UAC prompt, per-user scope).
 - **Two launchers**: `run.vbs` (silent, no console, no taskbar entry) and `run.bat` (debug, console visible).
@@ -59,7 +63,7 @@ First launch downloads the Whisper model (~800 MB). Subsequent launches are inst
 1. Focus any text input — Notepad, a chat box, a code editor, a browser field.
 2. **Hold Right Ctrl.** The waveform bubble fades in.
 3. Speak.
-4. **Release Right Ctrl.** Bubble flips to *Transcribing…*, then the transcript types itself into the focused window.
+4. **Release Right Ctrl.** Bubble flips to *Transcribing…*, then the transcript pastes itself into the focused window.
 
 ## Keyboard shortcuts
 
@@ -83,29 +87,31 @@ Right-click the tray icon:
 ## Architecture
 
 ```
-Right Ctrl down             Right Ctrl up
-        |                       |
-        v                       v
- +--------------+        +---------------+
- | MicStream    |------->| drain buffer  |
- | (sounddevice)|        +-------+-------+
- +------+-------+                |
-        |                        v
-        v                +---------------+     +-----------------+
- +--------------+        | faster-whisper|---->| pynput Typist   |
- | Rolling 0.5s |        | large-v3-turbo|     | types into focus|
- | waveform     |        | fp16 on CUDA  |     +-----------------+
- +------+-------+        +---------------+
-        |
-        v
- +--------------+
+Right Ctrl down                   Right Ctrl up
+        |                              |
+        v                              v
+ +--------------+              +---------------+
+ | MicStream    |------------->| drain buffer  |
+ | (sounddevice)|              +-------+-------+
+ | always-open  |                      |
+ | + 250ms      |                      v
+ | pre-roll     |              +---------------+     +---------------------+
+ +------+-------+              | faster-whisper|---->| Typist              |
+        |                      | large-v3-turbo|     | clipboard + Ctrl+V  |
+        v                      | fp16 on CUDA  |     | (saves & restores)  |
+ +--------------+              +---------------+     +---------------------+
  | Overlay      |
  | Pillow+Tk    |
  | 30 FPS bubble|
  +--------------+
+
+ +-------------------------+
+ | HotkeyManager watchdog  |   rebuilds the WH_KEYBOARD_LL hook on
+ | sleep/resume + 30 min   |   suspend/resume and on a 30 min timer
+ +-------------------------+
 ```
 
-Main thread owns the Tk mainloop for the overlay. Mic callbacks run on PortAudio's thread, the keyboard hook on pynput's thread, finalize/transcribe on a throwaway daemon thread, and the tray on its own pystray thread. A single lock inside `Dictation` serialises state transitions (active → finalizing → idle).
+Main thread owns the Tk mainloop for the overlay. Mic callbacks run on PortAudio's thread, the keyboard hook on pynput's thread, finalize/transcribe on a throwaway daemon thread, the tray on its own pystray thread, and the hotkey watchdog on its own daemon thread. A single lock inside `Dictation` serialises state transitions (active → finalizing → idle).
 
 ## Why faster-whisper large-v3-turbo
 
@@ -138,7 +144,10 @@ Already mitigated with `beam_size=5` in `asr.py`. If it still happens on your vo
 Already normalised in `asr.py` via `re.sub(r"\s+", " ", text).strip()`.
 
 ### Antivirus flags it as a keylogger
-pynput uses `WH_KEYBOARD_LL` — a Windows low-level keyboard hook. That API is used by both dictation tools and keyloggers, so heuristics trip. The code only checks for Right Ctrl + Ctrl+Alt+Q; it never stores or transmits keystrokes. Audit `main.py` to confirm. Add a folder exclusion if needed.
+pynput uses `WH_KEYBOARD_LL` — a Windows low-level keyboard hook. That API is used by both dictation tools and keyloggers, so heuristics trip. The code only checks for Right Ctrl + Ctrl+Alt+Q; it never stores or transmits keystrokes. Audit `main.py` and `hotkey.py` to confirm. Add a folder exclusion if needed.
+
+### Right Ctrl stops responding after the PC sleeps
+This was an older bug — Windows silently disables low-level keyboard hooks across sleep / hibernate / fast user switching, and pynput's listener stays "alive" but receives no events. `hotkey.py` now runs a watchdog that detects suspend/resume (via a wall-clock vs monotonic-clock gap probe) and force-rebuilds the hooks. There is also a 30 min belt-and-braces refresh. If you still see this, check the log for `hotkey rebuild` lines.
 
 ### Right Ctrl conflicts with a shortcut I use
 Edit `HOTKEY = keyboard.Key.ctrl_r` in `main.py`. Alternatives that don't cause combo conflicts:
@@ -150,14 +159,15 @@ Edit `HOTKEY = keyboard.Key.ctrl_r` in `main.py`. Alternatives that don't cause 
 
 ```
 local-speak/
-├── main.py           Entry: wires tray, overlay, listener, signal handlers
+├── main.py           Entry: wires tray, overlay, hotkey manager, signal handlers
 ├── asr.py            faster-whisper wrapper, thread-safe
-├── audio.py          Mic capture + rolling waveform ring buffer
+├── audio.py          Always-on mic + rolling ring buffer + 250ms pre-roll
 ├── overlay.py        Live-waveform bubble (Pillow composited, Tk displayed)
-├── inject.py         Keystroke output via pynput
+├── inject.py         Clipboard + Ctrl+V transcript injection (Win32 SendInput)
+├── hotkey.py         Resilient keyboard hook with sleep/resume watchdog
 ├── tray.py           pystray menu + generated icon
 ├── autostart.py      HKCU Run key read/write/delete
-├── logutil.py        RotatingFileHandler setup
+├── logutil.py        RotatingFileHandler setup, third-party loggers quieted
 ├── run.vbs           Silent launcher (no console)
 ├── run.bat           Debug launcher (console visible)
 ├── setup.bat         One-click install script
@@ -171,7 +181,6 @@ local-speak/
 - [ ] Swap model to **Parakeet TDT 0.6B v3** (NeMo) for sub-200 ms end-to-end
 - [ ] Silero-VAD auto-endpoint so you don't have to release the key
 - [ ] Configurable hotkey via tray submenu + persistent settings file
-- [ ] Clipboard-paste injection mode (for very long transcripts or keystroke-hostile apps)
 - [ ] TensorRT encoder export for the lowest-latency path
 
 ## Contributing
