@@ -5,25 +5,41 @@ Windows silently disables WH_KEYBOARD_LL hooks in several scenarios:
   * The user's session was locked and unlocked.
   * LowLevelHooksTimeout was exceeded -- e.g. our callback held the GIL
     too long during model warmup.
+  * On a fresh boot, services / Defender / GPU init starve the hook so
+    SetWindowsHookEx succeeds but no events are ever delivered.
 
-When that happens pynput's Listener thread is technically still alive
-(parked in GetMessage with a dead hook handle), but no keyboard events
-ever arrive. The user observes "Right Ctrl does nothing" with no error
-in the log.
+When that happens pynput's Listener thread is technically alive
+(parked in GetMessage), `running` is True, but no keyboard events ever
+arrive. The user observes "Right Ctrl does nothing" with no error.
 
-Mitigation:
-  1. A hidden message-only window subscribes to WM_POWERBROADCAST
-     (PBT_APMRESUMESUSPEND) and WM_WTSSESSION_CHANGE (SESSION_UNLOCK)
-     so we get an explicit signal from Windows on resume/unlock and
-     rebuild the hooks immediately.
-  2. A watchdog thread also rebuilds when the monotonic clock vs the
-     watchdog's intended wait length disagree (catches sleep on
-     systems where the explicit power notification is missed) or when
-     a pynput thread stopped running.
-  3. Periodic refresh every 5 minutes as belt-and-braces.
-  4. _teardown joins the old listener thread so its hook handle is
-     actually released before a new hook is installed -- previously
-     dead hooks accumulated in the chain after each rebuild.
+Mitigation, in order of how it triggers:
+
+  1. Startup self-test. After _build(), we synthesise a harmless key
+     (F24, unmapped in normal apps) via SendInput and verify our
+     listener saw it. If not, rebuild and retry. Loops until the hook
+     proves itself working. This catches the cold-boot case.
+
+  2. Live deafness probe. The watchdog compares the wall-clock age of
+     the user's last input (per Windows GetLastInputInfo) against our
+     listener's last-seen-event timestamp. If the user has been
+     actively typing within the last few seconds and our listener has
+     seen nothing for tens of seconds, the hook is dead and we rebuild.
+
+  3. Explicit resume signals. A hidden message-only window subscribes
+     to WM_POWERBROADCAST (PBT_APMRESUMESUSPEND/AUTOMATIC) and
+     WM_WTSSESSION_CHANGE (WTS_SESSION_UNLOCK) so we get an immediate
+     rebuild on suspend resume / session unlock.
+
+  4. Heuristic suspend probe. The watchdog also rebuilds when the
+     monotonic clock vs intended wait disagree by more than a threshold
+     -- backstop for systems where the explicit power notification is
+     missed.
+
+  5. Periodic refresh every 5 minutes as belt-and-braces.
+
+  6. _teardown joins the old listener thread so its hook handle is
+     actually released before the new hook is installed -- otherwise
+     stale hooks accumulate in the chain and clog event delivery.
 """
 from __future__ import annotations
 
@@ -43,7 +59,18 @@ SUSPEND_GAP_S = 20.0
 FORCE_REBUILD_S = 5 * 60.0     # belt-and-braces: rebuild every 5 minutes
 TEARDOWN_JOIN_S = 1.5          # seconds we wait for the old listener thread
 
-# ---------- Win32 plumbing for resume/unlock notifications ----------
+# Self-test (post-build): send a synthetic key, see if the listener notices.
+SELF_TEST_DELAY_S = 0.25
+SELF_TEST_RETRIES = 6
+SELF_TEST_BACKOFF_S = 0.5
+_VK_F24 = 0x87  # rare; not bound to anything in normal apps
+
+# Liveness probe: if the user typed within USER_RECENT_S but our listener has
+# seen nothing for LISTENER_DEAF_S, the hook is dead.
+USER_RECENT_S = 5.0
+LISTENER_DEAF_S = 30.0
+
+# ---------- Win32 plumbing ----------
 _user32 = ctypes.windll.user32
 _kernel32 = ctypes.windll.kernel32
 _wtsapi32 = ctypes.WinDLL("Wtsapi32.dll")
@@ -56,8 +83,9 @@ _PBT_APMRESUMEAUTOMATIC = 0x0012
 _WTS_SESSION_UNLOCK = 0x8
 _NOTIFY_FOR_THIS_SESSION = 0
 
-# LRESULT is LONG_PTR — pointer-sized on x64. Using a plain c_long would
-# truncate the return value and corrupt the message pump on 64-bit.
+_INPUT_KEYBOARD = 1
+_KEYEVENTF_KEYUP = 0x0002
+
 _LRESULT = ctypes.c_ssize_t
 
 _WNDPROC = ctypes.WINFUNCTYPE(
@@ -86,8 +114,93 @@ _user32.DispatchMessageW.argtypes = (ctypes.c_void_p,)
 _user32.DispatchMessageW.restype = _LRESULT
 _kernel32.GetModuleHandleW.argtypes = (wintypes.LPCWSTR,)
 _kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+_kernel32.GetTickCount.restype = wintypes.DWORD
 _wtsapi32.WTSRegisterSessionNotification.argtypes = (wintypes.HWND, wintypes.DWORD)
 _wtsapi32.WTSRegisterSessionNotification.restype = wintypes.BOOL
+
+
+# ---------- SendInput plumbing for the synthetic self-test key ----------
+ULONG_PTR = ctypes.c_size_t
+
+
+class _KEYBDINPUT(ctypes.Structure):
+    _fields_ = (
+        ("wVk", wintypes.WORD),
+        ("wScan", wintypes.WORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ULONG_PTR),
+    )
+
+
+class _MOUSEINPUT(ctypes.Structure):
+    _fields_ = (
+        ("dx", wintypes.LONG),
+        ("dy", wintypes.LONG),
+        ("mouseData", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ULONG_PTR),
+    )
+
+
+class _HARDWAREINPUT(ctypes.Structure):
+    _fields_ = (
+        ("uMsg", wintypes.DWORD),
+        ("wParamL", wintypes.WORD),
+        ("wParamH", wintypes.WORD),
+    )
+
+
+class _INPUT_UNION(ctypes.Union):
+    _fields_ = (("ki", _KEYBDINPUT), ("mi", _MOUSEINPUT), ("hi", _HARDWAREINPUT))
+
+
+class _INPUT(ctypes.Structure):
+    _anonymous_ = ("u",)
+    _fields_ = (("type", wintypes.DWORD), ("u", _INPUT_UNION))
+
+
+# Use a private WinDLL handle for SendInput so our argtypes don't clobber
+# inject.py's (both modules set argtypes for the same exported function;
+# whichever loads last wins, breaking the other one).
+_user32_si = ctypes.WinDLL("user32")
+_user32_si.SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(_INPUT), ctypes.c_int)
+_user32_si.SendInput.restype = wintypes.UINT
+
+
+# ---------- GetLastInputInfo ----------
+class _LASTINPUTINFO(ctypes.Structure):
+    _fields_ = (("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD))
+
+
+_user32.GetLastInputInfo.argtypes = (ctypes.POINTER(_LASTINPUTINFO),)
+_user32.GetLastInputInfo.restype = wintypes.BOOL
+
+
+def _last_user_input_age_s() -> float:
+    """How long ago (seconds) Windows received any user input. Inf if the
+    call fails."""
+    info = _LASTINPUTINFO(cbSize=ctypes.sizeof(_LASTINPUTINFO), dwTime=0)
+    if not _user32.GetLastInputInfo(ctypes.byref(info)):
+        return float("inf")
+    # Both GetTickCount and dwTime wrap every ~49 days; subtraction is
+    # well-defined modulo 2**32 thanks to wraparound semantics.
+    delta_ms = (_kernel32.GetTickCount() - info.dwTime) & 0xFFFFFFFF
+    return delta_ms / 1000.0
+
+
+def _send_synthetic(vk: int) -> None:
+    arr = (_INPUT * 2)()
+    arr[0] = _INPUT(type=_INPUT_KEYBOARD)
+    arr[0].ki = _KEYBDINPUT(wVk=vk, wScan=0, dwFlags=0, time=0, dwExtraInfo=0)
+    arr[1] = _INPUT(type=_INPUT_KEYBOARD)
+    arr[1].ki = _KEYBDINPUT(
+        wVk=vk, wScan=0, dwFlags=_KEYEVENTF_KEYUP, time=0, dwExtraInfo=0
+    )
+    _user32_si.SendInput(
+        2, ctypes.cast(arr, ctypes.POINTER(_INPUT)), ctypes.sizeof(_INPUT)
+    )
 
 
 class _WNDCLASS(ctypes.Structure):
@@ -106,18 +219,11 @@ class _WNDCLASS(ctypes.Structure):
 
 
 class _PowerNotifier:
-    """Listens for resume-from-sleep and session-unlock from Windows.
-
-    Owns its own thread + message-only window. On either event, calls
-    on_resume(reason) on the watchdog's thread (the callback is invoked
-    inline from the wndproc, so callers should keep the work cheap or
-    dispatch it themselves).
-    """
+    """Listens for resume-from-sleep and session-unlock from Windows."""
 
     def __init__(self, on_resume: Callable[[str], None]) -> None:
         self._on_resume = on_resume
         self._hwnd: int = 0
-        self._stop = False
         self._wndproc_ref = _WNDPROC(self._wndproc)  # keep ref alive
         self._thread = threading.Thread(
             target=self._run, daemon=True, name="hotkey-power-notifier"
@@ -166,7 +272,6 @@ class _PowerNotifier:
                 "WTSRegisterSessionNotification failed: %d",
                 _kernel32.GetLastError(),
             )
-
         msg = wintypes.MSG()
         while _user32.GetMessageW(ctypes.byref(msg), 0, 0, 0) > 0:
             _user32.TranslateMessage(ctypes.byref(msg))
@@ -180,8 +285,8 @@ class HotkeyManager:
         on_release: Callable,
         global_hotkeys: dict[str, Callable],
     ) -> None:
-        self._on_press = on_press
-        self._on_release = on_release
+        self._user_on_press = on_press
+        self._user_on_release = on_release
         self._global_hotkeys = global_hotkeys
         self._listener: keyboard.Listener | None = None
         self._global: keyboard.GlobalHotKeys | None = None
@@ -190,6 +295,9 @@ class HotkeyManager:
         self._build_lock = threading.Lock()
         self._wd_thread: threading.Thread | None = None
         self._power: _PowerNotifier | None = None
+        # Liveness tracking
+        self._last_event_at: float = time.monotonic()
+        self._self_test_seen = threading.Event()
 
     def start(self) -> None:
         self._build()
@@ -199,21 +307,62 @@ class HotkeyManager:
         self._wd_thread.start()
         self._power = _PowerNotifier(on_resume=self._on_external_resume)
         self._power.start()
+        # Run the cold-boot self-test off the main thread so startup
+        # ordering (overlay.mainloop) isn't held up.
+        threading.Thread(
+            target=self._run_self_test, daemon=True, name="hotkey-self-test"
+        ).start()
 
     def stop(self) -> None:
         self._stop.set()
         self._teardown()
 
-    def _on_external_resume(self, reason: str) -> None:
-        # Called from the power-notifier thread on resume/unlock. Rebuild
-        # immediately rather than waiting for the next watchdog tick.
-        self._rebuild(reason)
+    # ---------- event wrappers (track liveness, then forward) ----------
+    def _on_press_wrapped(self, key) -> None:
+        self._last_event_at = time.monotonic()
+        if self._is_self_test_key(key):
+            self._self_test_seen.set()
+            return  # don't forward; user code never sees the F24 probe
+        try:
+            self._user_on_press(key)
+        except Exception:
+            log.exception("user on_press raised")
 
+    def _on_release_wrapped(self, key) -> None:
+        self._last_event_at = time.monotonic()
+        if self._is_self_test_key(key):
+            return
+        try:
+            self._user_on_release(key)
+        except Exception:
+            log.exception("user on_release raised")
+
+    @staticmethod
+    def _is_self_test_key(key) -> bool:
+        # pynput maps F24 to keyboard.Key.f24 on Windows; vk is also exposed.
+        try:
+            if getattr(key, "vk", None) == _VK_F24:
+                return True
+        except Exception:
+            pass
+        return key == getattr(keyboard.Key, "f24", None)
+
+    # ---------- external triggers ----------
+    def _on_external_resume(self, reason: str) -> None:
+        self._rebuild(reason)
+        # Re-verify hooks work after a resume rebuild, in case the OS state
+        # is still settling.
+        threading.Thread(
+            target=self._run_self_test, daemon=True, name="hotkey-self-test"
+        ).start()
+
+    # ---------- core build/teardown ----------
     def _build(self) -> None:
+        self._self_test_seen.clear()
         self._global = keyboard.GlobalHotKeys(self._global_hotkeys)
         self._global.start()
         self._listener = keyboard.Listener(
-            on_press=self._on_press, on_release=self._on_release
+            on_press=self._on_press_wrapped, on_release=self._on_release_wrapped
         )
         self._listener.start()
         self._built_at = time.monotonic()
@@ -231,16 +380,14 @@ class HotkeyManager:
             except Exception:
                 pass
             if h.is_alive():
-                # Old listener thread didn't exit -- its hook handle is
-                # likely still registered. We can't force-unhook without
-                # private pynput internals, but logging tells us if this
-                # starts happening regularly.
-                log.warning("old hotkey listener didn't exit within %.1fs", TEARDOWN_JOIN_S)
+                log.warning(
+                    "old hotkey listener didn't exit within %.1fs",
+                    TEARDOWN_JOIN_S,
+                )
         self._listener = None
         self._global = None
 
     def _rebuild(self, reason: str) -> None:
-        # Serialise rebuilds so power notifier + watchdog can't race.
         if not self._build_lock.acquire(blocking=False):
             return
         try:
@@ -253,6 +400,33 @@ class HotkeyManager:
         finally:
             self._build_lock.release()
 
+    # ---------- self-test ----------
+    def _run_self_test(self) -> None:
+        # Give the freshly-built hook a moment to register at the kernel
+        # level before we probe it.
+        time.sleep(SELF_TEST_DELAY_S)
+        for attempt in range(1, SELF_TEST_RETRIES + 1):
+            if self._stop.is_set():
+                return
+            self._self_test_seen.clear()
+            try:
+                _send_synthetic(_VK_F24)
+            except Exception:
+                log.exception("self-test SendInput failed")
+                return
+            if self._self_test_seen.wait(timeout=0.5):
+                if attempt > 1:
+                    log.info("hotkey self-test passed on attempt %d", attempt)
+                return
+            log.warning(
+                "hotkey self-test attempt %d/%d: no event seen, rebuilding",
+                attempt, SELF_TEST_RETRIES,
+            )
+            self._rebuild(f"self-test failed (attempt {attempt})")
+            time.sleep(SELF_TEST_BACKOFF_S)
+        log.error("hotkey self-test exhausted retries; hook may be deaf")
+
+    # ---------- watchdog ----------
     def _alive(self) -> bool:
         return (
             self._listener is not None
@@ -272,6 +446,15 @@ class HotkeyManager:
                 continue
             if not self._alive():
                 self._rebuild("listener died")
+                continue
+            # Deafness probe: user is typing but we're not seeing it.
+            user_idle = _last_user_input_age_s()
+            listener_idle = now - self._last_event_at
+            if user_idle < USER_RECENT_S and listener_idle > LISTENER_DEAF_S:
+                self._rebuild(
+                    f"deafness (user input {user_idle:.1f}s ago, "
+                    f"listener silent {listener_idle:.1f}s)"
+                )
                 continue
             if now - self._built_at > FORCE_REBUILD_S:
                 self._rebuild("periodic refresh")
