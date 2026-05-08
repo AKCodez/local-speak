@@ -70,6 +70,11 @@ _VK_F24 = 0x87  # rare; not bound to anything in normal apps
 USER_RECENT_S = 5.0
 LISTENER_DEAF_S = 30.0
 
+# After this many consecutive deafness rebuilds without recovery, the
+# in-process hook is unrecoverable -- signal the supervisor to relaunch
+# with a fresh process.
+DEAFNESS_GIVEUP_THRESHOLD = 6
+
 # ---------- Win32 plumbing ----------
 _user32 = ctypes.windll.user32
 _kernel32 = ctypes.windll.kernel32
@@ -284,10 +289,12 @@ class HotkeyManager:
         on_press: Callable,
         on_release: Callable,
         global_hotkeys: dict[str, Callable],
+        on_giveup: Callable[[], None] | None = None,
     ) -> None:
         self._user_on_press = on_press
         self._user_on_release = on_release
         self._global_hotkeys = global_hotkeys
+        self._on_giveup = on_giveup
         self._listener: keyboard.Listener | None = None
         self._global: keyboard.GlobalHotKeys | None = None
         self._built_at: float = 0.0
@@ -298,6 +305,8 @@ class HotkeyManager:
         # Liveness tracking
         self._last_event_at: float = time.monotonic()
         self._self_test_seen = threading.Event()
+        self._deafness_count = 0
+        self._gave_up = False
 
     def start(self) -> None:
         self._build()
@@ -320,6 +329,7 @@ class HotkeyManager:
     # ---------- event wrappers (track liveness, then forward) ----------
     def _on_press_wrapped(self, key) -> None:
         self._last_event_at = time.monotonic()
+        self._deafness_count = 0  # any received event proves the hook works
         if self._is_self_test_key(key):
             self._self_test_seen.set()
             return  # don't forward; user code never sees the F24 probe
@@ -330,6 +340,7 @@ class HotkeyManager:
 
     def _on_release_wrapped(self, key) -> None:
         self._last_event_at = time.monotonic()
+        self._deafness_count = 0
         if self._is_self_test_key(key):
             return
         try:
@@ -451,10 +462,27 @@ class HotkeyManager:
             user_idle = _last_user_input_age_s()
             listener_idle = now - self._last_event_at
             if user_idle < USER_RECENT_S and listener_idle > LISTENER_DEAF_S:
+                self._deafness_count += 1
                 self._rebuild(
-                    f"deafness (user input {user_idle:.1f}s ago, "
+                    f"deafness {self._deafness_count}/{DEAFNESS_GIVEUP_THRESHOLD} "
+                    f"(user input {user_idle:.1f}s ago, "
                     f"listener silent {listener_idle:.1f}s)"
                 )
+                if (
+                    self._deafness_count >= DEAFNESS_GIVEUP_THRESHOLD
+                    and not self._gave_up
+                    and self._on_giveup is not None
+                ):
+                    self._gave_up = True
+                    log.error(
+                        "hotkey hooks unrecoverable after %d rebuilds; "
+                        "signaling supervisor for fresh-process restart",
+                        self._deafness_count,
+                    )
+                    try:
+                        self._on_giveup()
+                    except Exception:
+                        log.exception("on_giveup callback raised")
                 continue
             if now - self._built_at > FORCE_REBUILD_S:
                 self._rebuild("periodic refresh")

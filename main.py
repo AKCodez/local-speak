@@ -4,14 +4,22 @@ Entry point for the launchable app. Sets up logging, tray icon, keyboard
 listener, overlay, and the dictation lifecycle.
 
 Quit: Right-click tray -> Quit, or Ctrl+Alt+Q anywhere.
+
+Exit codes (read by run.vbs supervisor):
+  0  = clean user-initiated exit, do not relaunch.
+  42 = self-restart requested (keyboard hooks unrecoverable, etc.).
 """
 from __future__ import annotations
 
 import logging
 import os
 import signal
+import sys
 import threading
 from pathlib import Path
+
+EXIT_CLEAN = 0
+EXIT_SELF_RESTART = 42
 
 # Ensure working dir is the script's dir so imports + file lookups work the
 # same whether launched from a shortcut, Explorer, or the registry Run key.
@@ -48,6 +56,7 @@ class Dictation:
         self._finalizing = False
         self._lock = threading.Lock()
         self.exit_event = threading.Event()
+        self.exit_code = EXIT_CLEAN
         log.info("Ready. Hold Right Ctrl to record. Ctrl+Alt+Q to quit.")
 
     def on_press(self, key) -> None:
@@ -93,10 +102,11 @@ class Dictation:
         with self._lock:
             self.paused = bool(value)
 
-    def request_exit(self, reason: str) -> None:
+    def request_exit(self, reason: str, exit_code: int = EXIT_CLEAN) -> None:
         if self.exit_event.is_set():
             return
         log.info("quit (%s)", reason)
+        self.exit_code = exit_code
         self.exit_event.set()
         self.overlay.request_quit()
 
@@ -128,6 +138,9 @@ def main() -> None:
         on_press=d.on_press,
         on_release=d.on_release,
         global_hotkeys={QUIT_COMBO: lambda: d.request_exit("Ctrl+Alt+Q")},
+        on_giveup=lambda: d.request_exit(
+            "hotkey hooks unrecoverable", exit_code=EXIT_SELF_RESTART
+        ),
     )
     hotkeys.start()
 
@@ -143,7 +156,10 @@ def main() -> None:
         hotkeys.stop()
         tray.stop()
         d.shutdown()
-    log.info("==== STT exit ====")
+    log.info("==== STT exit (code=%d) ====", d.exit_code)
+    # Use sys.exit so the supervisor sees the right code. Daemon threads
+    # are torn down automatically.
+    sys.exit(d.exit_code)
 
 
 if __name__ == "__main__":
