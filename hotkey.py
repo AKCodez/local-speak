@@ -65,15 +65,21 @@ SELF_TEST_RETRIES = 6
 SELF_TEST_BACKOFF_S = 0.5
 _VK_F24 = 0x87  # rare; not bound to anything in normal apps
 
-# Liveness probe: if the user typed within USER_RECENT_S but our listener has
-# seen nothing for LISTENER_DEAF_S, the hook is dead.
-USER_RECENT_S = 5.0
-LISTENER_DEAF_S = 30.0
+# Deafness probe: poll the physical state of the hotkey at high frequency.
+# If the user holds Right Ctrl for HELD_REQUIRED_S but our listener has not
+# fired any key event in LISTENER_QUIET_S, the hook is definitively deaf
+# (the user is pressing OUR hotkey right now and we're not seeing it). This
+# avoids false positives from typing into elevated apps, which UIPI prevents
+# our low-integrity hook from observing.
+PROBE_INTERVAL_S = 0.05         # poll Right Ctrl every 50 ms
+HELD_REQUIRED_S = 0.20          # must be held this long before we declare
+LISTENER_QUIET_S = 0.15         # listener must have been silent for this long
 
-# After this many consecutive deafness rebuilds without recovery, the
-# in-process hook is unrecoverable -- signal the supervisor to relaunch
-# with a fresh process.
-DEAFNESS_GIVEUP_THRESHOLD = 6
+# After this many *separate* user holds confirm the hook is deaf, we give
+# up the in-process recovery and ask the supervisor to relaunch with a
+# fresh process. Each confirmation requires the user to deliberately hold
+# the key, so 3 is a strong, user-driven signal (not a clock-driven loop).
+DEAFNESS_GIVEUP_THRESHOLD = 3
 
 # ---------- Win32 plumbing ----------
 _user32 = ctypes.windll.user32
@@ -90,6 +96,7 @@ _NOTIFY_FOR_THIS_SESSION = 0
 
 _INPUT_KEYBOARD = 1
 _KEYEVENTF_KEYUP = 0x0002
+_VK_RCONTROL = 0xA3
 
 _LRESULT = ctypes.c_ssize_t
 
@@ -314,6 +321,9 @@ class HotkeyManager:
             target=self._watchdog, daemon=True, name="hotkey-watchdog"
         )
         self._wd_thread.start()
+        threading.Thread(
+            target=self._deafness_probe, daemon=True, name="hotkey-deaf-probe"
+        ).start()
         self._power = _PowerNotifier(on_resume=self._on_external_resume)
         self._power.start()
         # Run the cold-boot self-test off the main thread so startup
@@ -458,31 +468,59 @@ class HotkeyManager:
             if not self._alive():
                 self._rebuild("listener died")
                 continue
-            # Deafness probe: user is typing but we're not seeing it.
-            user_idle = _last_user_input_age_s()
-            listener_idle = now - self._last_event_at
-            if user_idle < USER_RECENT_S and listener_idle > LISTENER_DEAF_S:
-                self._deafness_count += 1
-                self._rebuild(
-                    f"deafness {self._deafness_count}/{DEAFNESS_GIVEUP_THRESHOLD} "
-                    f"(user input {user_idle:.1f}s ago, "
-                    f"listener silent {listener_idle:.1f}s)"
-                )
-                if (
-                    self._deafness_count >= DEAFNESS_GIVEUP_THRESHOLD
-                    and not self._gave_up
-                    and self._on_giveup is not None
-                ):
-                    self._gave_up = True
-                    log.error(
-                        "hotkey hooks unrecoverable after %d rebuilds; "
-                        "signaling supervisor for fresh-process restart",
-                        self._deafness_count,
-                    )
-                    try:
-                        self._on_giveup()
-                    except Exception:
-                        log.exception("on_giveup callback raised")
-                continue
             if now - self._built_at > FORCE_REBUILD_S:
                 self._rebuild("periodic refresh")
+
+    def _deafness_probe(self) -> None:
+        """Poll the physical state of Right Ctrl. When the user holds it
+        but our listener doesn't fire, the hook is definitively dead.
+
+        This is far more reliable than checking generic user activity
+        (GetLastInputInfo also counts input into elevated apps that our
+        low-integrity hook cannot legitimately see)."""
+        held_since: float | None = None
+        signaled_for_this_hold = False
+        while not self._stop.wait(PROBE_INTERVAL_S):
+            if self._gave_up:
+                return
+            ctrl_high = bool(_user32.GetAsyncKeyState(_VK_RCONTROL) & 0x8000)
+            if not ctrl_high:
+                held_since = None
+                signaled_for_this_hold = False
+                continue
+            now = time.monotonic()
+            if held_since is None:
+                held_since = now
+                continue
+            if signaled_for_this_hold:
+                continue
+            held_for = now - held_since
+            listener_idle = now - self._last_event_at
+            if held_for >= HELD_REQUIRED_S and listener_idle >= LISTENER_QUIET_S:
+                signaled_for_this_hold = True
+                self._handle_deafness(held_for, listener_idle)
+
+    def _handle_deafness(self, held_for: float, listener_idle: float) -> None:
+        self._deafness_count += 1
+        log.warning(
+            "deafness confirmed %d/%d: Right Ctrl held %.2fs, "
+            "listener silent %.2fs",
+            self._deafness_count, DEAFNESS_GIVEUP_THRESHOLD,
+            held_for, listener_idle,
+        )
+        self._rebuild(f"deafness {self._deafness_count}/{DEAFNESS_GIVEUP_THRESHOLD}")
+        if (
+            self._deafness_count >= DEAFNESS_GIVEUP_THRESHOLD
+            and not self._gave_up
+            and self._on_giveup is not None
+        ):
+            self._gave_up = True
+            log.error(
+                "hotkey hooks unrecoverable after %d confirmed holds; "
+                "signaling supervisor for fresh-process restart",
+                self._deafness_count,
+            )
+            try:
+                self._on_giveup()
+            except Exception:
+                log.exception("on_giveup callback raised")
