@@ -71,9 +71,9 @@ _VK_F24 = 0x87  # rare; not bound to anything in normal apps
 # (the user is pressing OUR hotkey right now and we're not seeing it). This
 # avoids false positives from typing into elevated apps, which UIPI prevents
 # our low-integrity hook from observing.
-PROBE_INTERVAL_S = 0.05         # poll Right Ctrl every 50 ms
-HELD_REQUIRED_S = 0.20          # must be held this long before we declare
-LISTENER_QUIET_S = 0.15         # listener must have been silent for this long
+PROBE_INTERVAL_S = 0.03         # poll Right Ctrl every 30 ms
+HELD_REQUIRED_S = 0.10          # must be held this long before we declare
+LISTENER_QUIET_S = 0.08         # listener must have been silent for this long
 
 # After this many *separate* user holds confirm the hook is deaf, we give
 # up the in-process recovery and ask the supervisor to relaunch with a
@@ -509,6 +509,15 @@ class HotkeyManager:
             held_for, listener_idle,
         )
         self._rebuild(f"deafness {self._deafness_count}/{DEAFNESS_GIVEUP_THRESHOLD}")
+        # Verify the rebuild actually produced a working hook. If self-test
+        # fails, _run_self_test will retry-rebuild several times and finally
+        # log a giveup error. That gives us much faster recovery than
+        # waiting for the user to hold Right Ctrl again.
+        threading.Thread(
+            target=self._run_self_test,
+            daemon=True,
+            name="hotkey-self-test-post-deafness",
+        ).start()
         if (
             self._deafness_count >= DEAFNESS_GIVEUP_THRESHOLD
             and not self._gave_up
