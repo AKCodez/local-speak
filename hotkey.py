@@ -65,15 +65,18 @@ SELF_TEST_RETRIES = 6
 SELF_TEST_BACKOFF_S = 0.5
 _VK_F24 = 0x87  # rare; not bound to anything in normal apps
 
-# Deafness probe: poll the physical state of the hotkey at high frequency.
-# If the user holds Right Ctrl for HELD_REQUIRED_S but our listener has not
-# fired any key event in LISTENER_QUIET_S, the hook is definitively deaf
-# (the user is pressing OUR hotkey right now and we're not seeing it). This
-# avoids false positives from typing into elevated apps, which UIPI prevents
-# our low-integrity hook from observing.
-PROBE_INTERVAL_S = 0.03         # poll Right Ctrl every 30 ms
-HELD_REQUIRED_S = 0.10          # must be held this long before we declare
-LISTENER_QUIET_S = 0.08         # listener must have been silent for this long
+# Deafness probe: watch the physical up->down EDGE of Right Ctrl via
+# GetAsyncKeyState. A working hook fires our listener's on_press for ctrl_r
+# within a few tens of ms of that edge. If the edge happens but the listener
+# never reports the matching press, the hook is genuinely deaf.
+#
+# We MUST key off the edge, not "the listener has gone quiet": a held
+# modifier key emits no events at all between press and release on a
+# perfectly working hook (Ctrl doesn't auto-repeat), so any "listener silent
+# for N ms" check pathologically self-triggers on every normal hold and the
+# resulting rebuild churn is what actually breaks dictation.
+PROBE_INTERVAL_S = 0.015        # poll Right Ctrl every 15 ms
+PRESS_GRACE_S = 0.12            # listener must report the press within this
 
 # After this many *separate* user holds confirm the hook is deaf, we give
 # up the in-process recovery and ask the supervisor to relaunch with a
@@ -310,7 +313,7 @@ class HotkeyManager:
         self._wd_thread: threading.Thread | None = None
         self._power: _PowerNotifier | None = None
         # Liveness tracking
-        self._last_event_at: float = time.monotonic()
+        self._listener_rctrl_press_at: float = 0.0
         self._self_test_seen = threading.Event()
         self._deafness_count = 0
         self._gave_up = False
@@ -338,18 +341,18 @@ class HotkeyManager:
 
     # ---------- event wrappers (track liveness, then forward) ----------
     def _on_press_wrapped(self, key) -> None:
-        self._last_event_at = time.monotonic()
         self._deafness_count = 0  # any received event proves the hook works
         if self._is_self_test_key(key):
             self._self_test_seen.set()
             return  # don't forward; user code never sees the F24 probe
+        if key == keyboard.Key.ctrl_r:
+            self._listener_rctrl_press_at = time.monotonic()
         try:
             self._user_on_press(key)
         except Exception:
             log.exception("user on_press raised")
 
     def _on_release_wrapped(self, key) -> None:
-        self._last_event_at = time.monotonic()
         self._deafness_count = 0
         if self._is_self_test_key(key):
             return
@@ -472,41 +475,46 @@ class HotkeyManager:
                 self._rebuild("periodic refresh")
 
     def _deafness_probe(self) -> None:
-        """Poll the physical state of Right Ctrl. When the user holds it
-        but our listener doesn't fire, the hook is definitively dead.
+        """Watch the physical up->down edge of Right Ctrl. A working hook
+        reports the matching listener press within PRESS_GRACE_S; if the
+        edge happens and no press is ever reported, the hook is deaf.
 
-        This is far more reliable than checking generic user activity
-        (GetLastInputInfo also counts input into elevated apps that our
-        low-integrity hook cannot legitimately see)."""
-        held_since: float | None = None
-        signaled_for_this_hold = False
+        Keying off the edge (not "listener has gone quiet") is essential: a
+        held modifier emits no events between press and release on a
+        perfectly working hook, so a quiet-listener check self-triggers on
+        every normal hold."""
+        was_down = False
+        edge_at: float | None = None
+        signaled = False
         while not self._stop.wait(PROBE_INTERVAL_S):
             if self._gave_up:
                 return
-            ctrl_high = bool(_user32.GetAsyncKeyState(_VK_RCONTROL) & 0x8000)
-            if not ctrl_high:
-                held_since = None
-                signaled_for_this_hold = False
+            is_down = bool(_user32.GetAsyncKeyState(_VK_RCONTROL) & 0x8000)
+            if is_down and not was_down:
+                edge_at = time.monotonic()  # user just pressed Right Ctrl
+                signaled = False
+            elif not is_down:
+                edge_at = None
+                signaled = False
+            was_down = is_down
+            if edge_at is None or signaled:
                 continue
-            now = time.monotonic()
-            if held_since is None:
-                held_since = now
+            # The real press happened up to one poll interval before we
+            # noticed the edge; accept a listener press from slightly before.
+            if self._listener_rctrl_press_at >= edge_at - PROBE_INTERVAL_S - 0.02:
+                edge_at = None  # listener saw the press -- hook is working
                 continue
-            if signaled_for_this_hold:
-                continue
-            held_for = now - held_since
-            listener_idle = now - self._last_event_at
-            if held_for >= HELD_REQUIRED_S and listener_idle >= LISTENER_QUIET_S:
-                signaled_for_this_hold = True
-                self._handle_deafness(held_for, listener_idle)
+            waited = time.monotonic() - edge_at
+            if waited >= PRESS_GRACE_S:
+                signaled = True
+                self._handle_deafness(waited)
 
-    def _handle_deafness(self, held_for: float, listener_idle: float) -> None:
+    def _handle_deafness(self, waited: float) -> None:
         self._deafness_count += 1
         log.warning(
-            "deafness confirmed %d/%d: Right Ctrl held %.2fs, "
-            "listener silent %.2fs",
-            self._deafness_count, DEAFNESS_GIVEUP_THRESHOLD,
-            held_for, listener_idle,
+            "deafness confirmed %d/%d: Right Ctrl pressed but listener saw "
+            "no matching event after %.2fs",
+            self._deafness_count, DEAFNESS_GIVEUP_THRESHOLD, waited,
         )
         self._rebuild(f"deafness {self._deafness_count}/{DEAFNESS_GIVEUP_THRESHOLD}")
         # Verify the rebuild actually produced a working hook. If self-test
