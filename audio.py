@@ -10,12 +10,19 @@ On `start()`, we also seed the ASR queue with the last PRE_ROLL_MS of the
 rolling ring buffer so audio spoken slightly before the hotkey press is
 included. This covers human reaction time (people often start speaking a
 beat before the key registers).
+
+WASAPI streams silently die across Windows sleep / hibernate / fast user
+switching: the InputStream object stays "open" but no callbacks ever fire
+again. A watchdog thread detects that (callbacks should fire continuously
+even for silence) and rebuilds the stream automatically so the user never
+has to relaunch the app after waking the PC.
 """
 from __future__ import annotations
 
 import logging
 import queue
 import threading
+import time
 
 import numpy as np
 import sounddevice as sd
@@ -27,6 +34,8 @@ CHANNELS = 1
 DTYPE = "float32"
 RECENT_SECONDS = 0.5          # ring buffer size (for overlay + pre-roll source)
 PRE_ROLL_MS = 250             # prepended to each recording
+SILENCE_GRACE_S = 4.0         # callbacks gone this long -> stream is dead
+WATCHDOG_INTERVAL_S = 2.0     # how often the watchdog polls
 
 
 class MicStream:
@@ -49,7 +58,17 @@ class MicStream:
         self._recording = False
         self._recording_lock = threading.Lock()
 
+        self._stream_lock = threading.Lock()
+        self._closed = threading.Event()
+        self._last_callback_at = time.monotonic()
+
         self._open_stream()
+        self._last_callback_at = time.monotonic()  # reset after open settles
+
+        self._watchdog_thread = threading.Thread(
+            target=self._watchdog, daemon=True, name="audio-watchdog"
+        )
+        self._watchdog_thread.start()
 
     # --------------------------------------------------------------- stream
     def _open_stream(self) -> None:
@@ -63,6 +82,7 @@ class MicStream:
         log.info("mic stream opened @ %d Hz", self.sample_rate)
 
     def _callback(self, indata, frames, time_info, status) -> None:
+        self._last_callback_at = time.monotonic()
         data = indata.copy().reshape(-1)
 
         # Always-on: rolling ring buffer (overlay + pre-roll source)
@@ -117,16 +137,43 @@ class MicStream:
 
     def close(self) -> None:
         """Final teardown. Call on app exit."""
+        self._closed.set()
         with self._recording_lock:
             self._recording = False
-        if self._stream is not None:
-            try:
-                self._stream.stop()
-                self._stream.close()
-            except Exception as e:
-                log.error("mic close failed: %s", e)
-            finally:
+        with self._stream_lock:
+            if self._stream is not None:
+                try:
+                    self._stream.stop()
+                    self._stream.close()
+                except Exception as e:
+                    log.error("mic close failed: %s", e)
+                finally:
+                    self._stream = None
+
+    # --------------------------------------------------------- watchdog
+    def _watchdog(self) -> None:
+        while not self._closed.wait(WATCHDOG_INTERVAL_S):
+            gap = time.monotonic() - self._last_callback_at
+            if gap > SILENCE_GRACE_S:
+                log.warning("mic stream silent for %.1fs -- restarting", gap)
+                self._restart_stream()
+
+    def _restart_stream(self) -> None:
+        with self._stream_lock:
+            if self._closed.is_set():
+                return
+            if self._stream is not None:
+                try:
+                    self._stream.stop()
+                    self._stream.close()
+                except Exception:
+                    log.exception("error closing dead mic stream")
                 self._stream = None
+            try:
+                self._open_stream()
+                self._last_callback_at = time.monotonic()
+            except Exception:
+                log.exception("mic reopen failed; will retry on next tick")
 
     # --------------------------------------------------------- consumer API
     def drain(self) -> np.ndarray:
