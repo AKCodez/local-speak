@@ -35,7 +35,9 @@ DTYPE = "float32"
 RECENT_SECONDS = 0.5          # ring buffer size (for overlay + pre-roll source)
 PRE_ROLL_MS = 250             # prepended to each recording
 SILENCE_GRACE_S = 4.0         # callbacks gone this long -> stream is dead
-WATCHDOG_INTERVAL_S = 2.0     # how often the watchdog polls
+WATCHDOG_INTERVAL_S = 2.0     # how often the watchdog polls when stream is healthy
+RESTART_VERIFY_S = 1.0        # after reopen, wait this long for a callback to prove it
+RESTART_BACKOFF_MAX_S = 30.0  # cap the backoff so recovery is bounded
 
 
 class MicStream:
@@ -63,7 +65,6 @@ class MicStream:
         self._last_callback_at = time.monotonic()
 
         self._open_stream()
-        self._last_callback_at = time.monotonic()  # reset after open settles
 
         self._watchdog_thread = threading.Thread(
             target=self._watchdog, daemon=True, name="audio-watchdog"
@@ -152,11 +153,50 @@ class MicStream:
 
     # --------------------------------------------------------- watchdog
     def _watchdog(self) -> None:
-        while not self._closed.wait(WATCHDOG_INTERVAL_S):
-            gap = time.monotonic() - self._last_callback_at
-            if gap > SILENCE_GRACE_S:
-                log.warning("mic stream silent for %.1fs -- restarting", gap)
+        """Detect stream death (callbacks stopped) and recover.
+
+        Verifies each restart by waiting RESTART_VERIFY_S and checking that
+        _last_callback_at advanced -- it only advances from real callbacks,
+        not from anything the restart does. Backs off exponentially up to
+        RESTART_BACKOFF_MAX_S so a sustained-dead device doesn't generate a
+        4-second restart storm in the log. Outer try/except keeps the thread
+        alive across any unexpected failure."""
+        next_wait = WATCHDOG_INTERVAL_S
+        consecutive_failed_restarts = 0
+        reported_dead = False
+        while not self._closed.wait(next_wait):
+            try:
+                gap = time.monotonic() - self._last_callback_at
+                if gap <= SILENCE_GRACE_S:
+                    if reported_dead:
+                        log.info("mic stream restored (callbacks resumed)")
+                        reported_dead = False
+                    consecutive_failed_restarts = 0
+                    next_wait = WATCHDOG_INTERVAL_S
+                    continue
+                if not reported_dead:
+                    log.warning("mic stream silent for %.1fs -- restarting", gap)
+                    reported_dead = True
+                restart_at = time.monotonic()
                 self._restart_stream()
+                if self._closed.wait(RESTART_VERIFY_S):
+                    return
+                if self._last_callback_at > restart_at:
+                    log.info("mic stream restored after %d attempt(s)",
+                             consecutive_failed_restarts + 1)
+                    consecutive_failed_restarts = 0
+                    reported_dead = False
+                    next_wait = WATCHDOG_INTERVAL_S
+                else:
+                    consecutive_failed_restarts += 1
+                    next_wait = min(
+                        WATCHDOG_INTERVAL_S
+                        * (2 ** min(consecutive_failed_restarts, 6)),
+                        RESTART_BACKOFF_MAX_S,
+                    )
+            except Exception:
+                log.exception("audio watchdog tick failed")
+                next_wait = WATCHDOG_INTERVAL_S
 
     def _restart_stream(self) -> None:
         with self._stream_lock:
@@ -171,7 +211,6 @@ class MicStream:
                 self._stream = None
             try:
                 self._open_stream()
-                self._last_callback_at = time.monotonic()
             except Exception:
                 log.exception("mic reopen failed; will retry on next tick")
 
