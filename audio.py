@@ -19,10 +19,12 @@ has to relaunch the app after waking the PC.
 """
 from __future__ import annotations
 
+import ctypes
 import logging
 import queue
 import threading
 import time
+from ctypes import wintypes
 
 import numpy as np
 import sounddevice as sd
@@ -38,6 +40,109 @@ SILENCE_GRACE_S = 4.0         # callbacks gone this long -> stream is dead
 WATCHDOG_INTERVAL_S = 2.0     # how often the watchdog polls when stream is healthy
 RESTART_VERIFY_S = 1.0        # after reopen, wait this long for a callback to prove it
 RESTART_BACKOFF_MAX_S = 30.0  # cap the backoff so recovery is bounded
+
+# ---------- Win32 device-change notification ----------
+# WM_DEVICECHANGE fires on USB hotplug. We use it to force a stream rebind
+# whenever an audio device arrives or leaves -- otherwise our InputStream
+# stays bound to whichever device was default at open time, and a user who
+# unplugs their preferred mic and then plugs it back in keeps capturing
+# from the fallback device that became default during the unplug window.
+_WM_DEVICECHANGE = 0x0219
+_DBT_DEVICEARRIVAL = 0x8000
+_DBT_DEVICEREMOVECOMPLETE = 0x8004
+_HWND_MESSAGE = wintypes.HWND(-3)
+_LRESULT = ctypes.c_ssize_t
+_WNDPROC = ctypes.WINFUNCTYPE(
+    _LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM
+)
+
+_user32 = ctypes.windll.user32
+_kernel32 = ctypes.windll.kernel32
+
+_user32.CreateWindowExW.argtypes = (
+    wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+    wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID,
+)
+_user32.CreateWindowExW.restype = wintypes.HWND
+_user32.RegisterClassW.argtypes = (ctypes.c_void_p,)
+_user32.RegisterClassW.restype = wintypes.ATOM
+_user32.DefWindowProcW.argtypes = (
+    wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+)
+_user32.DefWindowProcW.restype = _LRESULT
+_user32.GetMessageW.argtypes = (
+    ctypes.c_void_p, wintypes.HWND, wintypes.UINT, wintypes.UINT,
+)
+_user32.GetMessageW.restype = wintypes.BOOL
+_user32.TranslateMessage.argtypes = (ctypes.c_void_p,)
+_user32.TranslateMessage.restype = wintypes.BOOL
+_user32.DispatchMessageW.argtypes = (ctypes.c_void_p,)
+_user32.DispatchMessageW.restype = _LRESULT
+_kernel32.GetModuleHandleW.argtypes = (wintypes.LPCWSTR,)
+_kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+
+
+class _WNDCLASS(ctypes.Structure):
+    _fields_ = [
+        ("style", wintypes.UINT),
+        ("lpfnWndProc", _WNDPROC),
+        ("cbClsExtra", ctypes.c_int),
+        ("cbWndExtra", ctypes.c_int),
+        ("hInstance", wintypes.HINSTANCE),
+        ("hIcon", wintypes.HICON),
+        ("hCursor", wintypes.HANDLE),
+        ("hbrBackground", wintypes.HBRUSH),
+        ("lpszMenuName", wintypes.LPCWSTR),
+        ("lpszClassName", wintypes.LPCWSTR),
+    ]
+
+
+class _DeviceChangeNotifier:
+    """Hidden message-only window that calls on_change for hotplug events."""
+
+    def __init__(self, on_change) -> None:
+        self._on_change = on_change
+        self._wndproc_ref = _WNDPROC(self._wndproc)
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name="audio-device-notifier"
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _wndproc(self, hwnd, msg, wparam, lparam):
+        if msg == _WM_DEVICECHANGE and wparam in (
+            _DBT_DEVICEARRIVAL, _DBT_DEVICEREMOVECOMPLETE,
+        ):
+            try:
+                self._on_change()
+            except Exception:
+                log.exception("device-change handler raised")
+            return 1
+        return _user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+    def _run(self) -> None:
+        cls = _WNDCLASS()
+        cls.lpfnWndProc = self._wndproc_ref
+        cls.hInstance = _kernel32.GetModuleHandleW(None)
+        cls.lpszClassName = "STTAudioDeviceNotifier"
+        if not _user32.RegisterClassW(ctypes.byref(cls)):
+            log.error("audio device RegisterClassW failed: %d",
+                      _kernel32.GetLastError())
+            return
+        hwnd = _user32.CreateWindowExW(
+            0, cls.lpszClassName, "stt-audio-device-notifier", 0,
+            0, 0, 0, 0, _HWND_MESSAGE, 0, cls.hInstance, 0,
+        )
+        if not hwnd:
+            log.error("audio device CreateWindowExW failed: %d",
+                      _kernel32.GetLastError())
+            return
+        msg = wintypes.MSG()
+        while _user32.GetMessageW(ctypes.byref(msg), 0, 0, 0) > 0:
+            _user32.TranslateMessage(ctypes.byref(msg))
+            _user32.DispatchMessageW(ctypes.byref(msg))
 
 
 class MicStream:
@@ -70,6 +175,11 @@ class MicStream:
             target=self._watchdog, daemon=True, name="audio-watchdog"
         )
         self._watchdog_thread.start()
+
+        self._device_notifier = _DeviceChangeNotifier(
+            on_change=self._on_device_change
+        )
+        self._device_notifier.start()
 
     # --------------------------------------------------------------- stream
     def _open_stream(self) -> None:
@@ -150,6 +260,19 @@ class MicStream:
                     log.error("mic close failed: %s", e)
                 finally:
                     self._stream = None
+
+    # --------------------------------------------------------- hotplug
+    def _on_device_change(self) -> None:
+        """Force the watchdog to rebind on its next tick (within ~2 s).
+
+        We deliberately do not restart from the message-pump thread -- the
+        watchdog already owns the restart path under _stream_lock with
+        proper logging and backoff. Setting _last_callback_at to zero
+        makes the next tick see an effectively-infinite gap and trigger a
+        restart that re-inits PortAudio and binds to whatever is now
+        default."""
+        log.info("audio device hotplug; rebinding mic on next watchdog tick")
+        self._last_callback_at = 0.0
 
     # --------------------------------------------------------- watchdog
     def _watchdog(self) -> None:
