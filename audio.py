@@ -209,6 +209,15 @@ class MicStream:
                 except Exception:
                     log.exception("error closing dead mic stream")
                 self._stream = None
+            # Force PortAudio to re-enumerate devices. Its device list is
+            # cached at library init, so a USB mic unplug/replug or a
+            # default-endpoint switch leaves the cache stale and any
+            # freshly-opened stream gets bound to a now-invalid index.
+            try:
+                sd._terminate()
+                sd._initialize()
+            except Exception:
+                log.exception("PortAudio re-init failed; continuing anyway")
             try:
                 self._open_stream()
             except Exception:
