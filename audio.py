@@ -39,7 +39,10 @@ PRE_ROLL_MS = 250             # prepended to each recording
 SILENCE_GRACE_S = 4.0         # callbacks gone this long -> stream is dead
 WATCHDOG_INTERVAL_S = 2.0     # how often the watchdog polls when stream is healthy
 RESTART_VERIFY_S = 1.0        # after reopen, wait this long for a callback to prove it
-RESTART_BACKOFF_MAX_S = 30.0  # cap the backoff so recovery is bounded
+RESTART_BACKOFF_MAX_S = 4.0   # cap retry spacing low: a USB mic re-enumerating
+                              # after wake is ready within seconds, so a long
+                              # backoff just leaves the mic dead far longer than
+                              # the device actually needs.
 
 # ---------- Win32 device-change notification ----------
 # WM_DEVICECHANGE fires on USB hotplug. We use it to force a stream rebind
@@ -170,6 +173,7 @@ class MicStream:
         self._last_callback_at = time.monotonic()
 
         self._open_stream()
+        log.info("mic stream opened @ %d Hz", self.sample_rate)
 
         self._watchdog_thread = threading.Thread(
             target=self._watchdog, daemon=True, name="audio-watchdog"
@@ -190,7 +194,6 @@ class MicStream:
             callback=self._callback,
         )
         self._stream.start()
-        log.info("mic stream opened @ %d Hz", self.sample_rate)
 
     def _callback(self, indata, frames, time_info, status) -> None:
         self._last_callback_at = time.monotonic()
