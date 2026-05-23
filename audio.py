@@ -43,6 +43,13 @@ RESTART_BACKOFF_MAX_S = 4.0   # cap retry spacing low: a USB mic re-enumerating
                               # after wake is ready within seconds, so a long
                               # backoff just leaves the mic dead far longer than
                               # the device actually needs.
+DEAD_DEVICE_S = 12.0          # callbacks flowing but bit-silent this long means
+                              # we're bound to the wrong/dead endpoint (a fallback
+                              # picked during a wake/hotplug storm); real mics
+                              # always have a noise floor, so rebind to the default.
+HOTPLUG_SETTLE_S = 1.5        # after a hotplug event, let Windows finish promoting
+                              # the new default before we rebind to it.
+SIGNAL_FLOOR = 1e-6           # |sample| above this counts as real audio signal
 
 # ---------- Win32 device-change notification ----------
 # WM_DEVICECHANGE fires on USB hotplug. We use it to force a stream rebind
@@ -171,9 +178,13 @@ class MicStream:
         self._stream_lock = threading.Lock()
         self._closed = threading.Event()
         self._last_callback_at = time.monotonic()
+        self._last_signal_at = time.monotonic()
+        self._last_dead_rebind_at = 0.0
+        self._bound_device_name = "?"
 
         self._open_stream()
-        log.info("mic stream opened @ %d Hz", self.sample_rate)
+        log.info("mic stream opened @ %d Hz (device: %s)",
+                 self.sample_rate, self._bound_device_name)
 
         self._watchdog_thread = threading.Thread(
             target=self._watchdog, daemon=True, name="audio-watchdog"
@@ -194,10 +205,21 @@ class MicStream:
             callback=self._callback,
         )
         self._stream.start()
+        try:
+            self._bound_device_name = sd.query_devices(kind="input")["name"]
+        except Exception:
+            self._bound_device_name = "?"
 
     def _callback(self, indata, frames, time_info, status) -> None:
-        self._last_callback_at = time.monotonic()
+        now = time.monotonic()
+        self._last_callback_at = now
         data = indata.copy().reshape(-1)
+
+        # Track when we last saw real signal. A working mic always carries a
+        # noise floor; a wrong/dead endpoint returns bit-exact silence. The
+        # watchdog uses this to detect "callbacks flowing but no audio".
+        if data.size and float(np.abs(data).max()) > SIGNAL_FLOOR:
+            self._last_signal_at = now
 
         # Always-on: rolling ring buffer (overlay + pre-roll source)
         with self._recent_lock:
@@ -266,16 +288,24 @@ class MicStream:
 
     # --------------------------------------------------------- hotplug
     def _on_device_change(self) -> None:
-        """Force the watchdog to rebind on its next tick (within ~2 s).
+        """Rebind the mic shortly after a USB hotplug.
 
-        We deliberately do not restart from the message-pump thread -- the
-        watchdog already owns the restart path under _stream_lock with
-        proper logging and backoff. Setting _last_callback_at to zero
-        makes the next tick see an effectively-infinite gap and trigger a
-        restart that re-inits PortAudio and binds to whatever is now
-        default."""
-        log.info("audio device hotplug; rebinding mic on next watchdog tick")
-        self._last_callback_at = 0.0
+        We wait HOTPLUG_SETTLE_S first: a device-arrival event fires before
+        Windows promotes the device to the default endpoint, so rebinding
+        immediately would re-open the old fallback. After the settle we zero
+        _last_callback_at, which makes the watchdog's next tick see an
+        effectively-infinite gap and run the restart path (re-init PortAudio,
+        open the now-current default) under its lock with proper logging."""
+        log.info("audio device hotplug; rebinding after %.1fs settle",
+                 HOTPLUG_SETTLE_S)
+
+        def _arm() -> None:
+            if not self._closed.wait(HOTPLUG_SETTLE_S):
+                self._last_callback_at = 0.0
+
+        threading.Thread(
+            target=_arm, daemon=True, name="audio-hotplug-rebind"
+        ).start()
 
     # --------------------------------------------------------- watchdog
     def _watchdog(self) -> None:
@@ -295,10 +325,12 @@ class MicStream:
                 gap = time.monotonic() - self._last_callback_at
                 if gap <= SILENCE_GRACE_S:
                     if reported_dead:
-                        log.info("mic stream restored (callbacks resumed)")
+                        log.info("mic stream restored (callbacks resumed) "
+                                 "(device: %s)", self._bound_device_name)
                         reported_dead = False
                     consecutive_failed_restarts = 0
                     next_wait = WATCHDOG_INTERVAL_S
+                    self._check_dead_device()
                     continue
                 if not reported_dead:
                     log.warning("mic stream silent for %.1fs -- restarting", gap)
@@ -308,8 +340,9 @@ class MicStream:
                 if self._closed.wait(RESTART_VERIFY_S):
                     return
                 if self._last_callback_at > restart_at:
-                    log.info("mic stream restored after %d attempt(s)",
-                             consecutive_failed_restarts + 1)
+                    log.info("mic stream restored after %d attempt(s) (device: %s)",
+                             consecutive_failed_restarts + 1,
+                             self._bound_device_name)
                     consecutive_failed_restarts = 0
                     reported_dead = False
                     next_wait = WATCHDOG_INTERVAL_S
@@ -323,6 +356,30 @@ class MicStream:
             except Exception:
                 log.exception("audio watchdog tick failed")
                 next_wait = WATCHDOG_INTERVAL_S
+
+    def _check_dead_device(self) -> None:
+        """Rebind if callbacks are flowing but carry only digital silence.
+
+        After a wake/hotplug storm the stream can bind to a fallback endpoint
+        that delivers callbacks full of zeros -- the watchdog's liveness check
+        passes, but the user sees a flat waveform and gets no transcript. A
+        real mic always has a noise floor, so prolonged bit-silence means the
+        wrong device. Rate-limited so a genuinely muted mic doesn't loop."""
+        now = time.monotonic()
+        if now - self._last_signal_at <= DEAD_DEVICE_S:
+            return
+        if now - self._last_dead_rebind_at <= DEAD_DEVICE_S:
+            return
+        log.warning(
+            "mic device '%s' digitally silent for %.0fs -- likely wrong "
+            "endpoint; rebinding to current default",
+            self._bound_device_name, now - self._last_signal_at,
+        )
+        self._last_dead_rebind_at = now
+        self._restart_stream()
+        # Fresh window so we re-evaluate the new binding rather than
+        # immediately tripping again on the same timestamp.
+        self._last_signal_at = time.monotonic()
 
     def _restart_stream(self) -> None:
         with self._stream_lock:
