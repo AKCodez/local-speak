@@ -212,6 +212,13 @@ class MicStream:
 
     def _callback(self, indata, frames, time_info, status) -> None:
         now = time.monotonic()
+        if now - self._last_callback_at > 1.0:
+            # Callback flow was interrupted (sleep/resume, restart, glitch).
+            # Start a fresh signal window so the dead-device check measures
+            # bit-silence only over continuous callback flow -- otherwise the
+            # gap across a multi-hour sleep reads as hours of "silence" and
+            # trips a spurious rebind the instant the mic wakes back up.
+            self._last_signal_at = now
         self._last_callback_at = now
         data = indata.copy().reshape(-1)
 
@@ -328,6 +335,7 @@ class MicStream:
                         log.info("mic stream restored (callbacks resumed) "
                                  "(device: %s)", self._bound_device_name)
                         reported_dead = False
+                        self._last_signal_at = time.monotonic()
                     consecutive_failed_restarts = 0
                     next_wait = WATCHDOG_INTERVAL_S
                     self._check_dead_device()
@@ -377,6 +385,7 @@ class MicStream:
         )
         self._last_dead_rebind_at = now
         self._restart_stream()
+        log.info("rebound to device: %s", self._bound_device_name)
         # Fresh window so we re-evaluate the new binding rather than
         # immediately tripping again on the same timestamp.
         self._last_signal_at = time.monotonic()
@@ -403,6 +412,7 @@ class MicStream:
                 log.exception("PortAudio re-init failed; continuing anyway")
             try:
                 self._open_stream()
+                self._last_signal_at = time.monotonic()  # fresh window per binding
             except Exception:
                 log.exception("mic reopen failed; will retry on next tick")
 
