@@ -141,6 +141,9 @@ def main() -> None:
         on_giveup=lambda: d.request_exit(
             "hotkey hooks unrecoverable", exit_code=EXIT_SELF_RESTART
         ),
+        on_suspend=lambda: d.request_exit(
+            "resume from sleep", exit_code=EXIT_SELF_RESTART
+        ),
     )
     hotkeys.start()
 

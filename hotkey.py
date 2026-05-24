@@ -236,8 +236,13 @@ class _WNDCLASS(ctypes.Structure):
 class _PowerNotifier:
     """Listens for resume-from-sleep and session-unlock from Windows."""
 
-    def __init__(self, on_resume: Callable[[str], None]) -> None:
-        self._on_resume = on_resume
+    def __init__(
+        self,
+        on_suspend_resume: Callable[[], None],
+        on_session_unlock: Callable[[], None],
+    ) -> None:
+        self._on_suspend_resume = on_suspend_resume
+        self._on_session_unlock = on_session_unlock
         self._hwnd: int = 0
         self._wndproc_ref = _WNDPROC(self._wndproc)  # keep ref alive
         self._thread = threading.Thread(
@@ -252,13 +257,13 @@ class _PowerNotifier:
             _PBT_APMRESUMESUSPEND, _PBT_APMRESUMEAUTOMATIC
         ):
             try:
-                self._on_resume("resume from suspend")
+                self._on_suspend_resume()
             except Exception:
                 log.exception("power notifier callback failed")
             return 1
         if msg == _WM_WTSSESSION_CHANGE and wparam == _WTS_SESSION_UNLOCK:
             try:
-                self._on_resume("session unlock")
+                self._on_session_unlock()
             except Exception:
                 log.exception("session notifier callback failed")
             return 0
@@ -300,11 +305,13 @@ class HotkeyManager:
         on_release: Callable,
         global_hotkeys: dict[str, Callable],
         on_giveup: Callable[[], None] | None = None,
+        on_suspend: Callable[[], None] | None = None,
     ) -> None:
         self._user_on_press = on_press
         self._user_on_release = on_release
         self._global_hotkeys = global_hotkeys
         self._on_giveup = on_giveup
+        self._on_suspend = on_suspend
         self._listener: keyboard.Listener | None = None
         self._global: keyboard.GlobalHotKeys | None = None
         self._built_at: float = 0.0
@@ -327,7 +334,10 @@ class HotkeyManager:
         threading.Thread(
             target=self._deafness_probe, daemon=True, name="hotkey-deaf-probe"
         ).start()
-        self._power = _PowerNotifier(on_resume=self._on_external_resume)
+        self._power = _PowerNotifier(
+            on_suspend_resume=self._handle_suspend,
+            on_session_unlock=lambda: self._on_external_resume("session unlock"),
+        )
         self._power.start()
         # Run the cold-boot self-test off the main thread so startup
         # ordering (overlay.mainloop) isn't held up.
@@ -372,6 +382,22 @@ class HotkeyManager:
         return key == getattr(keyboard.Key, "f24", None)
 
     # ---------- external triggers ----------
+    def _handle_suspend(self) -> None:
+        """Resume from sleep. Prefer a full fresh-process restart (the
+        supervisor relaunches us) over an in-process rebuild: a fresh
+        process re-inits every subsystem -- hooks, mic, PortAudio device
+        list -- with no stale clocks or device handles, which is the only
+        thing that has proven reliable across wake. Falls back to an
+        in-process rebuild if no restart hook is wired."""
+        if self._on_suspend is not None:
+            log.info("resume from suspend; requesting fresh-process restart")
+            try:
+                self._on_suspend()
+            except Exception:
+                log.exception("on_suspend callback raised")
+            return
+        self._on_external_resume("resume from suspend")
+
     def _on_external_resume(self, reason: str) -> None:
         self._rebuild(reason)
         # Re-verify hooks work after a resume rebuild, in case the OS state
@@ -466,6 +492,16 @@ class HotkeyManager:
             gap = now - last
             last = now
             if gap > SUSPEND_GAP_S:
+                if self._on_suspend is not None:
+                    log.info(
+                        "suspend/resume detected (gap=%.1fs); requesting "
+                        "fresh-process restart", gap,
+                    )
+                    try:
+                        self._on_suspend()
+                    except Exception:
+                        log.exception("on_suspend callback raised")
+                    return  # process is exiting; stop the watchdog
                 self._rebuild(f"suspend/resume detected (gap={gap:.1f}s)")
                 continue
             if not self._alive():
