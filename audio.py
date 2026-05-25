@@ -181,6 +181,7 @@ class MicStream:
         self._last_signal_at = time.monotonic()
         self._last_dead_rebind_at = 0.0
         self._bound_device_name = "?"
+        self._preferred_device_name: str | None = None
 
         self._open_stream()
         log.info("mic stream opened @ %d Hz (device: %s)",
@@ -198,7 +199,9 @@ class MicStream:
 
     # --------------------------------------------------------------- stream
     def _open_stream(self) -> None:
+        device = self._resolve_device()
         self._stream = sd.InputStream(
+            device=device,
             samplerate=self.sample_rate,
             channels=CHANNELS,
             dtype=DTYPE,
@@ -206,9 +209,34 @@ class MicStream:
         )
         self._stream.start()
         try:
-            self._bound_device_name = sd.query_devices(kind="input")["name"]
+            info = (sd.query_devices(device) if device is not None
+                    else sd.query_devices(kind="input"))
+            self._bound_device_name = info["name"]
+            if self._preferred_device_name is None:
+                # Lock onto the mic we started with so a later hotplug can't
+                # strand us on a virtual/fallback endpoint (e.g. NVIDIA
+                # Broadcast) that Windows momentarily makes the default.
+                self._preferred_device_name = self._bound_device_name
         except Exception:
             self._bound_device_name = "?"
+
+    def _resolve_device(self) -> int | None:
+        """Index of the preferred input device if present, else None (use the
+        PortAudio default). Pins capture to the mic we started with: after a
+        USB unplug/replug Windows may make a virtual device the default, but
+        the user's real mic is back in the list under its known name, so we
+        re-open that explicitly instead of trusting the transient default."""
+        if not self._preferred_device_name:
+            return None
+        try:
+            devices = sd.query_devices()
+        except Exception:
+            return None
+        for idx, dev in enumerate(devices):
+            if (dev.get("max_input_channels", 0) > 0
+                    and dev.get("name") == self._preferred_device_name):
+                return idx
+        return None
 
     def _callback(self, indata, frames, time_info, status) -> None:
         now = time.monotonic()
