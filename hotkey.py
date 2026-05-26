@@ -351,10 +351,14 @@ class HotkeyManager:
 
     # ---------- event wrappers (track liveness, then forward) ----------
     def _on_press_wrapped(self, key) -> None:
-        self._deafness_count = 0  # any received event proves the hook works
         if self._is_self_test_key(key):
             self._self_test_seen.set()
-            return  # don't forward; user code never sees the F24 probe
+            # Injected F24 proves the hook delivers SYNTHETIC input, which
+            # says nothing about physical input. It must NOT reset the
+            # deafness count, or a physical-deaf hook never escalates to the
+            # supervisor restart. Don't forward to user code either.
+            return
+        self._deafness_count = 0  # a real received event proves the hook works
         if key == keyboard.Key.ctrl_r:
             self._listener_rctrl_press_at = time.monotonic()
         try:
@@ -363,9 +367,9 @@ class HotkeyManager:
             log.exception("user on_press raised")
 
     def _on_release_wrapped(self, key) -> None:
-        self._deafness_count = 0
         if self._is_self_test_key(key):
             return
+        self._deafness_count = 0
         try:
             self._user_on_release(key)
         except Exception:

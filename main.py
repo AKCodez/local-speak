@@ -11,6 +11,7 @@ Exit codes (read by run.vbs supervisor):
 """
 from __future__ import annotations
 
+import ctypes
 import logging
 import os
 import signal
@@ -42,6 +43,15 @@ HOTKEY = keyboard.Key.ctrl_r
 QUIT_COMBO = "<ctrl>+<alt>+q"
 SAMPLE_RATE = 16_000
 MIN_AUDIO_SAMPLES = SAMPLE_RATE // 4  # 0.25 s -- skip accidental taps
+
+# Cold-boot self-heal. When Windows autostarts us during the post-boot
+# thrash (Defender scan, GPU/USB init), the keyboard hook and mic often come
+# up degraded; a relaunch once the system has settled reliably fixes it. So
+# if we started within BOOT_WINDOW_S of boot, schedule one restart at
+# BOOT_SETTLE_UPTIME_S of uptime. BOOT_SETTLE_UPTIME_S must exceed
+# BOOT_WINDOW_S so the relaunched process doesn't reschedule and loop.
+BOOT_WINDOW_S = 90
+BOOT_SETTLE_UPTIME_S = 150
 
 
 class Dictation:
@@ -117,6 +127,31 @@ class Dictation:
             pass
 
 
+def _schedule_cold_boot_restart(d: Dictation) -> None:
+    """If we autostarted during the post-boot window, request one fresh-
+    process restart once the system has settled (see BOOT_* constants)."""
+    try:
+        k32 = ctypes.WinDLL("kernel32")
+        k32.GetTickCount64.restype = ctypes.c_ulonglong
+        uptime_s = k32.GetTickCount64() / 1000.0
+    except Exception:
+        return
+    if uptime_s >= BOOT_WINDOW_S:
+        return  # manual launch or debug relaunch, not a boot-time autostart
+    delay = max(0.0, BOOT_SETTLE_UPTIME_S - uptime_s)
+    log.info(
+        "cold-boot start (uptime %.0fs); will restart fresh in %.0fs once the "
+        "system settles", uptime_s, delay,
+    )
+
+    def _fire() -> None:
+        if d.exit_event.wait(delay):
+            return  # already exiting for another reason
+        d.request_exit("cold-boot settle restart", exit_code=EXIT_SELF_RESTART)
+
+    threading.Thread(target=_fire, daemon=True, name="cold-boot-restart").start()
+
+
 def main() -> None:
     logutil.configure()
     log.info("==== STT startup ====")
@@ -146,6 +181,7 @@ def main() -> None:
         ),
     )
     hotkeys.start()
+    _schedule_cold_boot_restart(d)
 
     signal.signal(signal.SIGINT, lambda *_: d.request_exit("SIGINT"))
     if hasattr(signal, "SIGBREAK"):
