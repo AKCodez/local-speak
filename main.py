@@ -17,6 +17,7 @@ import os
 import signal
 import sys
 import threading
+import time
 from pathlib import Path
 
 EXIT_CLEAN = 0
@@ -44,6 +45,13 @@ QUIT_COMBO = "<ctrl>+<alt>+q"
 SAMPLE_RATE = 16_000
 MIN_AUDIO_SAMPLES = SAMPLE_RATE // 4  # 0.25 s -- skip accidental taps
 
+# Stale-recording guard. If a hook rebuild lands between a press and its
+# release, on_release is never delivered and `active` stays True forever,
+# silently ignoring all future presses. A watchdog watches the physical key
+# and force-finalizes if we're "active" while Right Ctrl is physically up.
+_VK_RCONTROL = 0xA3
+STALE_ACTIVE_S = 0.4
+
 # Cold-boot self-heal. When Windows autostarts us during the post-boot
 # thrash (Defender scan, GPU/USB init), the keyboard hook and mic often come
 # up degraded; a relaunch once the system has settled reliably fixes it. So
@@ -67,6 +75,10 @@ class Dictation:
         self._lock = threading.Lock()
         self.exit_event = threading.Event()
         self.exit_code = EXIT_CLEAN
+        threading.Thread(
+            target=self._stale_active_watchdog, daemon=True,
+            name="stale-active-watchdog",
+        ).start()
         log.info("Ready. Hold Right Ctrl to record. Ctrl+Alt+Q to quit.")
 
     def on_press(self, key) -> None:
@@ -107,6 +119,29 @@ class Dictation:
             self.overlay.call_on_ui(self.overlay.hide)
             with self._lock:
                 self._finalizing = False
+
+    def _stale_active_watchdog(self) -> None:
+        """Recover from a missed key-release. If on_release never arrives
+        (a hook rebuild can drop it), `active` is stuck True and every later
+        press is ignored. When we're active but Right Ctrl has been
+        physically up for STALE_ACTIVE_S, synthesize the release -- this also
+        salvages the transcript if the user actually spoke."""
+        user32 = ctypes.windll.user32
+        up_since: float | None = None
+        while not self.exit_event.wait(0.05):
+            if not self.active:
+                up_since = None
+                continue
+            if bool(user32.GetAsyncKeyState(_VK_RCONTROL) & 0x8000):
+                up_since = None  # key physically held -- normal recording
+                continue
+            now = time.monotonic()
+            if up_since is None:
+                up_since = now
+            elif now - up_since >= STALE_ACTIVE_S:
+                up_since = None
+                log.warning("recording release was missed; finalizing")
+                self.on_release(HOTKEY)
 
     def set_paused(self, value: bool) -> None:
         with self._lock:
