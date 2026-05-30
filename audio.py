@@ -366,7 +366,8 @@ class MicStream:
                         self._last_signal_at = time.monotonic()
                     consecutive_failed_restarts = 0
                     next_wait = WATCHDOG_INTERVAL_S
-                    self._check_dead_device()
+                    if not self._reclaim_preferred_device():
+                        self._check_dead_device()
                     continue
                 if not reported_dead:
                     log.warning("mic stream silent for %.1fs -- restarting", gap)
@@ -392,6 +393,38 @@ class MicStream:
             except Exception:
                 log.exception("audio watchdog tick failed")
                 next_wait = WATCHDOG_INTERVAL_S
+
+    def _reclaim_preferred_device(self) -> bool:
+        """If we're bound to a fallback but the preferred mic is back, retake
+        it. Returns True if a rebind was issued.
+
+        Cold boot is the killer case: the Yeti is briefly absent during the
+        post-boot thrash, so a restart falls back to the system default --
+        which can be a virtual device like NVIDIA Broadcast that delivers
+        callbacks (so the liveness and dead-device checks are both satisfied)
+        and we get stranded there. This snaps back to the real mic the moment
+        Windows finishes enumerating it."""
+        pref = self._preferred_device_name
+        if not pref or self._bound_device_name == pref:
+            return False
+        try:
+            devices = sd.query_devices()
+        except Exception:
+            return False
+        present = any(
+            d.get("max_input_channels", 0) > 0 and d.get("name") == pref
+            for d in devices
+        )
+        if not present:
+            return False
+        log.info(
+            "preferred mic '%s' is back (currently on '%s') -- reclaiming",
+            pref, self._bound_device_name,
+        )
+        self._restart_stream()
+        log.info("rebound to device: %s", self._bound_device_name)
+        self._last_signal_at = time.monotonic()
+        return True
 
     def _check_dead_device(self) -> None:
         """Rebind if callbacks are flowing but carry only digital silence.

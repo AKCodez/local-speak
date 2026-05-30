@@ -58,8 +58,13 @@ STALE_ACTIVE_S = 0.4
 # if we started within BOOT_WINDOW_S of boot, schedule one restart at
 # BOOT_SETTLE_UPTIME_S of uptime. BOOT_SETTLE_UPTIME_S must exceed
 # BOOT_WINDOW_S so the relaunched process doesn't reschedule and loop.
-BOOT_WINDOW_S = 90
-BOOT_SETTLE_UPTIME_S = 150
+#
+# The window is generous: on a busy boot the autostart can fire 90-150s in
+# (a real miss was logged at 99s uptime), so a tight window silently skips
+# the heal. Better to occasionally restart a healthy process than to never
+# heal a degraded one.
+BOOT_WINDOW_S = 180
+BOOT_SETTLE_UPTIME_S = 210
 
 
 class Dictation:
