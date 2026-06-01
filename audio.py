@@ -43,6 +43,8 @@ RESTART_BACKOFF_MAX_S = 4.0   # cap retry spacing low: a USB mic re-enumerating
                               # after wake is ready within seconds, so a long
                               # backoff just leaves the mic dead far longer than
                               # the device actually needs.
+REINIT_EVERY_N_ATTEMPTS = 5   # how often a silence-retry does the heavy global
+                              # PortAudio re-init vs. just reopening the stream.
 DEAD_DEVICE_S = 12.0          # callbacks flowing but bit-silent this long means
                               # we're bound to the wrong/dead endpoint (a fallback
                               # picked during a wake/hotplug storm); real mics
@@ -373,7 +375,10 @@ class MicStream:
                     log.warning("mic stream silent for %.1fs -- restarting", gap)
                     reported_dead = True
                 restart_at = time.monotonic()
-                self._restart_stream()
+                # Heavy PortAudio re-init only every Nth attempt: a constant
+                # global reset prevents the subsystem from settling post-wake.
+                reinit = consecutive_failed_restarts % REINIT_EVERY_N_ATTEMPTS == 0
+                self._restart_stream(reinit_portaudio=reinit)
                 if self._closed.wait(RESTART_VERIFY_S):
                     return
                 if self._last_callback_at > restart_at:
@@ -451,7 +456,7 @@ class MicStream:
         # immediately tripping again on the same timestamp.
         self._last_signal_at = time.monotonic()
 
-    def _restart_stream(self) -> None:
+    def _restart_stream(self, reinit_portaudio: bool = True) -> None:
         with self._stream_lock:
             if self._closed.is_set():
                 return
@@ -462,15 +467,20 @@ class MicStream:
                 except Exception:
                     log.exception("error closing dead mic stream")
                 self._stream = None
-            # Force PortAudio to re-enumerate devices. Its device list is
-            # cached at library init, so a USB mic unplug/replug or a
-            # default-endpoint switch leaves the cache stale and any
-            # freshly-opened stream gets bound to a now-invalid index.
-            try:
-                sd._terminate()
-                sd._initialize()
-            except Exception:
-                log.exception("PortAudio re-init failed; continuing anyway")
+            # Optionally force PortAudio to re-enumerate devices. Its device
+            # list is cached at library init, so a USB unplug/replug or a
+            # default-endpoint switch needs this to be seen. But it is a heavy
+            # GLOBAL reset, and hammering it every few seconds while the audio
+            # subsystem is still settling after wake/boot keeps knocking the
+            # device back down before a stream can stabilise -- which is what
+            # caused a 5-minute, 55-attempt dead window after sleep. So the
+            # caller throttles it: re-init occasionally, just reopen otherwise.
+            if reinit_portaudio:
+                try:
+                    sd._terminate()
+                    sd._initialize()
+                except Exception:
+                    log.exception("PortAudio re-init failed; continuing anyway")
             try:
                 self._open_stream()
                 self._last_signal_at = time.monotonic()  # fresh window per binding
