@@ -45,6 +45,8 @@ RESTART_BACKOFF_MAX_S = 4.0   # cap retry spacing low: a USB mic re-enumerating
                               # the device actually needs.
 REINIT_EVERY_N_ATTEMPTS = 5   # how often a silence-retry does the heavy global
                               # PortAudio re-init vs. just reopening the stream.
+RECLAIM_CHECK_INTERVAL_S = 5  # while stranded on a non-preferred mic, how often
+                              # to re-enumerate and look for the preferred one.
 DEAD_DEVICE_S = 12.0          # callbacks flowing but bit-silent this long means
                               # we're bound to the wrong/dead endpoint (a fallback
                               # picked during a wake/hotplug storm); real mics
@@ -182,6 +184,7 @@ class MicStream:
         self._last_callback_at = time.monotonic()
         self._last_signal_at = time.monotonic()
         self._last_dead_rebind_at = 0.0
+        self._last_reclaim_check_at = 0.0
         self._bound_device_name = "?"
         self._preferred_device_name: str | None = None
 
@@ -403,14 +406,32 @@ class MicStream:
         """If we're bound to a fallback but the preferred mic is back, retake
         it. Returns True if a rebind was issued.
 
-        Cold boot is the killer case: the Yeti is briefly absent during the
-        post-boot thrash, so a restart falls back to the system default --
-        which can be a virtual device like NVIDIA Broadcast that delivers
+        Cold boot / wake is the killer case: the Yeti is briefly absent while
+        the subsystem settles, so a restart falls back to the system default
+        -- which can be a virtual device like NVIDIA Broadcast that delivers
         callbacks (so the liveness and dead-device checks are both satisfied)
-        and we get stranded there. This snaps back to the real mic the moment
-        Windows finishes enumerating it."""
+        and we get stranded there.
+
+        Crucially we must RE-ENUMERATE before checking presence:
+        sd.query_devices() reads PortAudio's cached list, frozen at the last
+        init. On the healthy path we never re-init, so a stale list would hide
+        the Yeti's return and we'd stay stuck forever -- which is exactly the
+        bug this had. Re-init is heavy, so do it at most every
+        RECLAIM_CHECK_INTERVAL_S, and only while actually on the wrong mic."""
         pref = self._preferred_device_name
         if not pref or self._bound_device_name == pref:
+            return False
+        now = time.monotonic()
+        if now - self._last_reclaim_check_at < RECLAIM_CHECK_INTERVAL_S:
+            return False
+        self._last_reclaim_check_at = now
+        # Refresh PortAudio's device list so a mic that re-enumerated after
+        # wake is actually visible.
+        try:
+            sd._terminate()
+            sd._initialize()
+        except Exception:
+            log.exception("device re-enumerate failed during reclaim")
             return False
         try:
             devices = sd.query_devices()
@@ -426,7 +447,8 @@ class MicStream:
             "preferred mic '%s' is back (currently on '%s') -- reclaiming",
             pref, self._bound_device_name,
         )
-        self._restart_stream()
+        # List is already fresh from the re-enumerate above; don't redo it.
+        self._restart_stream(reinit_portaudio=False)
         log.info("rebound to device: %s", self._bound_device_name)
         self._last_signal_at = time.monotonic()
         return True
