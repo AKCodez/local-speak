@@ -47,6 +47,18 @@ REINIT_EVERY_N_ATTEMPTS = 5   # how often a silence-retry does the heavy global
                               # PortAudio re-init vs. just reopening the stream.
 RECLAIM_CHECK_INTERVAL_S = 5  # while stranded on a non-preferred mic, how often
                               # to re-enumerate and look for the preferred one.
+
+# Virtual / pass-through capture endpoints that Windows may momentarily make
+# the default during a wake/boot storm. They deliver callbacks (so they look
+# "alive") but are not the user's real mic, so we never auto-select them: we
+# wait for a real device instead. The user's preferred mic, once locked, is
+# always allowed even if its name matched here.
+_VIRTUAL_DEVICE_HINTS = ("nvidia broadcast", "sound mapper",
+                         "primary sound capture")
+
+# Sentinel: preferred mic is set but currently absent -> do NOT open a
+# fallback, wait for it to come back.
+_DEVICE_ABSENT = object()
 DEAD_DEVICE_S = 12.0          # callbacks flowing but bit-silent this long means
                               # we're bound to the wrong/dead endpoint (a fallback
                               # picked during a wake/hotplug storm); real mics
@@ -187,10 +199,12 @@ class MicStream:
         self._last_reclaim_check_at = 0.0
         self._bound_device_name = "?"
         self._preferred_device_name: str | None = None
+        self._waiting_for_pref_logged = False
 
         self._open_stream()
-        log.info("mic stream opened @ %d Hz (device: %s)",
-                 self.sample_rate, self._bound_device_name)
+        if self._stream is not None:
+            log.info("mic stream opened @ %d Hz (device: %s)",
+                     self.sample_rate, self._bound_device_name)
 
         self._watchdog_thread = threading.Thread(
             target=self._watchdog, daemon=True, name="audio-watchdog"
@@ -205,6 +219,18 @@ class MicStream:
     # --------------------------------------------------------------- stream
     def _open_stream(self) -> None:
         device = self._resolve_device()
+        if device is _DEVICE_ABSENT:
+            # Hard pin: the preferred mic isn't here right now. Do NOT bind a
+            # fallback -- that's how we used to get stranded on NVIDIA
+            # Broadcast. Leave the stream closed; the watchdog keeps retrying
+            # (re-enumerating) until the preferred mic returns.
+            self._stream = None
+            if not self._waiting_for_pref_logged:
+                log.warning("preferred mic '%s' absent; waiting for it "
+                            "(not binding any fallback)",
+                            self._preferred_device_name)
+                self._waiting_for_pref_logged = True
+            return
         self._stream = sd.InputStream(
             device=device,
             samplerate=self.sample_rate,
@@ -213,35 +239,57 @@ class MicStream:
             callback=self._callback,
         )
         self._stream.start()
+        self._waiting_for_pref_logged = False
         try:
             info = (sd.query_devices(device) if device is not None
                     else sd.query_devices(kind="input"))
             self._bound_device_name = info["name"]
             if self._preferred_device_name is None:
                 # Lock onto the mic we started with so a later hotplug can't
-                # strand us on a virtual/fallback endpoint (e.g. NVIDIA
-                # Broadcast) that Windows momentarily makes the default.
+                # strand us on a virtual/fallback endpoint.
                 self._preferred_device_name = self._bound_device_name
         except Exception:
             self._bound_device_name = "?"
 
-    def _resolve_device(self) -> int | None:
-        """Index of the preferred input device if present, else None (use the
-        PortAudio default). Pins capture to the mic we started with: after a
-        USB unplug/replug Windows may make a virtual device the default, but
-        the user's real mic is back in the list under its known name, so we
-        re-open that explicitly instead of trusting the transient default."""
-        if not self._preferred_device_name:
-            return None
+    @staticmethod
+    def _is_virtual(name: str) -> bool:
+        low = name.lower()
+        return any(hint in low for hint in _VIRTUAL_DEVICE_HINTS)
+
+    def _resolve_device(self):
+        """Pick the input device to open.
+
+        - Preferred mic known: return its index if present, else _DEVICE_ABSENT
+          (caller must wait, never bind a fallback).
+        - No preferred yet (first open): the first real (non-virtual) input
+          device, preferring the system default; _DEVICE_ABSENT if only
+          virtual devices exist, so we never lock onto NVIDIA Broadcast."""
         try:
             devices = sd.query_devices()
         except Exception:
-            return None
+            return _DEVICE_ABSENT if self._preferred_device_name else None
+
+        pref = self._preferred_device_name
+        if pref:
+            for idx, dev in enumerate(devices):
+                if (dev.get("max_input_channels", 0) > 0
+                        and dev.get("name") == pref):
+                    return idx
+            return _DEVICE_ABSENT
+
+        # First open: choose the default input if it's a real device,
+        # otherwise the first real input device. Never auto-pick a virtual one.
+        try:
+            default_name = sd.query_devices(kind="input")["name"]
+        except Exception:
+            default_name = None
+        if default_name and not self._is_virtual(default_name):
+            return None  # None == let PortAudio use the system default
         for idx, dev in enumerate(devices):
             if (dev.get("max_input_channels", 0) > 0
-                    and dev.get("name") == self._preferred_device_name):
+                    and not self._is_virtual(dev.get("name", ""))):
                 return idx
-        return None
+        return _DEVICE_ABSENT
 
     def _callback(self, indata, frames, time_info, status) -> None:
         now = time.monotonic()
@@ -380,7 +428,13 @@ class MicStream:
                 restart_at = time.monotonic()
                 # Heavy PortAudio re-init only every Nth attempt: a constant
                 # global reset prevents the subsystem from settling post-wake.
-                reinit = consecutive_failed_restarts % REINIT_EVERY_N_ATTEMPTS == 0
+                # But while we're waiting for an absent preferred mic (no
+                # stream open), always re-init so we actually see it come back
+                # -- there's no live stream for the reset to disturb.
+                waiting = self._stream is None and self._preferred_device_name
+                reinit = (bool(waiting)
+                          or consecutive_failed_restarts
+                          % REINIT_EVERY_N_ATTEMPTS == 0)
                 self._restart_stream(reinit_portaudio=reinit)
                 if self._closed.wait(RESTART_VERIFY_S):
                     return
