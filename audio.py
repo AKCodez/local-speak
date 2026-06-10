@@ -200,6 +200,7 @@ class MicStream:
         self._bound_device_name = "?"
         self._preferred_device_name: str | None = None
         self._waiting_for_pref_logged = False
+        self._rebind_requested = False
 
         self._open_stream()
         if self._stream is not None:
@@ -374,22 +375,30 @@ class MicStream:
                 finally:
                     self._stream = None
 
+    # --------------------------------------------------------- rebind API
+    def request_rebind(self, reason: str) -> None:
+        """Ask the watchdog to restart the stream on its next tick (<=2s).
+
+        This is an explicit flag rather than the old trick of zeroing
+        _last_callback_at: if callbacks are still flowing (wrong/dead-but-
+        chatty device), the very next callback would overwrite the zeroed
+        timestamp within ~30ms and the watchdog would never notice."""
+        log.warning("mic rebind requested (%s)", reason)
+        self._rebind_requested = True
+
     # --------------------------------------------------------- hotplug
     def _on_device_change(self) -> None:
         """Rebind the mic shortly after a USB hotplug.
 
         We wait HOTPLUG_SETTLE_S first: a device-arrival event fires before
         Windows promotes the device to the default endpoint, so rebinding
-        immediately would re-open the old fallback. After the settle we zero
-        _last_callback_at, which makes the watchdog's next tick see an
-        effectively-infinite gap and run the restart path (re-init PortAudio,
-        open the now-current default) under its lock with proper logging."""
+        immediately would re-open the old fallback."""
         log.info("audio device hotplug; rebinding after %.1fs settle",
                  HOTPLUG_SETTLE_S)
 
         def _arm() -> None:
             if not self._closed.wait(HOTPLUG_SETTLE_S):
-                self._last_callback_at = 0.0
+                self._rebind_requested = True
 
         threading.Thread(
             target=_arm, daemon=True, name="audio-hotplug-rebind"
@@ -410,6 +419,14 @@ class MicStream:
         reported_dead = False
         while not self._closed.wait(next_wait):
             try:
+                if self._rebind_requested:
+                    self._rebind_requested = False
+                    self._restart_stream(reinit_portaudio=True)
+                    log.info("explicit rebind done (device: %s)",
+                             self._bound_device_name)
+                    self._last_signal_at = time.monotonic()
+                    next_wait = WATCHDOG_INTERVAL_S
+                    continue
                 gap = time.monotonic() - self._last_callback_at
                 if gap <= SILENCE_GRACE_S:
                     if reported_dead:

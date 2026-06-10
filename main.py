@@ -45,6 +45,12 @@ QUIT_COMBO = "<ctrl>+<alt>+q"
 SAMPLE_RATE = 16_000
 MIN_AUDIO_SAMPLES = SAMPLE_RATE // 4  # 0.25 s -- skip accidental taps
 
+# A real utterance peaks orders of magnitude above this (whispering ~1e-3,
+# normal speech ~0.05+). A clip whose peak is below it is digital silence
+# from a dead capture stream -- the user spoke and got nothing. Detect it,
+# say so in the log, and force a mic rebind instead of failing silently.
+DEAD_RECORDING_PEAK = 1e-4
+
 # Stale-recording guard. If a hook rebuild lands between a press and its
 # release, on_release is never delivered and `active` stays True forever,
 # silently ignoring all future presses. A watchdog watches the physical key
@@ -113,6 +119,19 @@ class Dictation:
     def _finalize(self, audio: np.ndarray) -> None:
         try:
             if audio.size < MIN_AUDIO_SAMPLES:
+                return
+            peak = float(np.abs(audio).max())
+            if peak < DEAD_RECORDING_PEAK:
+                # The user held the key and spoke, but the stream delivered
+                # digital silence: the capture device is in a dead state.
+                # Without this check the empty transcript was discarded with
+                # no log line at all -- "it broke" with a clean log.
+                log.warning(
+                    "recording was digital silence (peak=%.2e over %.2fs); "
+                    "capture stream is dead -- forcing mic rebind",
+                    peak, audio.size / SAMPLE_RATE,
+                )
+                self.mic.request_rebind("dead recording")
                 return
             transcript = self.asr.transcribe(audio).strip()
             if not transcript:
